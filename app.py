@@ -211,7 +211,8 @@ button[data-testid="baseButton-secondary"] {
 """, unsafe_allow_html=True)
 
 # ─── 定数・マスタ読み込み ────────────────────────────────────────
-COLUMNS = ["顧客ID", "注文日", "ふりがな", "お名前", "電話番号1", "電話番号2", "品種名", "台木", "本数", "備考"]
+COLUMNS = ["顧客ID", "注文日", "受付方法", "ふりがな", "お名前", "電話番号1", "電話番号2", "品種名", "台木", "本数", "備考"]
+UKETSUKE = ["", "電話", "FAX", "メール", "郵便", "来社"]
 MASTER_EXCEL = os.path.join(os.path.dirname(__file__), "苗木早見表　一覧.xlsx")
 FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash-lite", "gemini-2.0-flash"]
 MODEL_LABELS = {
@@ -284,8 +285,9 @@ def extract_order_from_image(image_bytes, media_type, model):
 品種名・台木・本数は複数行ある場合もあるので、すべて配列に入れてください。{hint_text}
 
 {{
-  "顧客ID": "注文書の右上に記載されている個人ID番号（数字のみ、なければ空文字）",
+  "顧客ID": "注文書の右上「No.」欄に記載されている個人ID番号（数字のみ、なければ空文字）",
   "注文日": "元号または西暦の日付文字列",
+  "受付方法": "注文日の右にある「電話・FAX・メール／郵便・来社」のうち丸で囲まれた、または選択されているもの1つ（電話/FAX/メール/郵便/来社のいずれか。判別できなければ空文字）",
   "ふりがな": "名前のふりがな",
   "お名前": "漢字の名前",
   "電話番号1": "電話番号1",
@@ -319,7 +321,7 @@ JSONのみ返してください。"""
     raise last_err
 
 def flatten_to_rows(form):
-    base = {k: form.get(k, "") for k in ["顧客ID","注文日","ふりがな","お名前","電話番号1","電話番号2","備考"]}
+    base = {k: form.get(k, "") for k in ["顧客ID","注文日","受付方法","ふりがな","お名前","電話番号1","電話番号2","備考"]}
     rows = []
     for item in form.get("items", [{"品種名":"","台木":"","本数":""}]):
         row = base.copy()
@@ -398,7 +400,7 @@ with col_left:
 
     if st.button("✏️ 手入力で追加", use_container_width=True):
         st.session_state.editing = {
-            "顧客ID":"","注文日":"","ふりがな":"","お名前":"",
+            "顧客ID":"","注文日":"","受付方法":"","ふりがな":"","お名前":"",
             "電話番号1":"","電話番号2":"",
             "items":[{"品種名":"","台木":"","本数":""}],
             "備考":"",
@@ -424,10 +426,15 @@ with col_right:
 
         with st.form("order_form"):
             n_items = len(d.get("items", None) or [{}])
-            ri1, ri2, ri3 = st.columns([1, 2, 2])
+            ri1, ri2, ri3, ri4 = st.columns([1, 2, 1.3, 2])
             customer_id = ri1.text_input("🔢 顧客ID", value=d.get("顧客ID",""))
             order_date  = ri2.text_input("注文日",    value=d.get("注文日",""))
-            furigana    = ri3.text_input("ふりがな",  value=d.get("ふりがな",""))
+            _uke = str(d.get("受付方法","") or "").strip()
+            uketsuke = ri3.selectbox(
+                "受付方法", UKETSUKE,
+                index=UKETSUKE.index(_uke) if _uke in UKETSUKE else 0,
+            )
+            furigana    = ri4.text_input("ふりがな",  value=d.get("ふりがな",""))
             r3, r4, r5 = st.columns(3)
             name   = r3.text_input("お名前",    value=d.get("お名前",""))
             phone1 = r4.text_input("電話番号1", value=d.get("電話番号1",""))
@@ -450,7 +457,8 @@ with col_right:
 
             if st.form_submit_button("➕ 一覧に追加", type="primary", use_container_width=True):
                 form_data = {
-                    "顧客ID":customer_id,"注文日":order_date,"ふりがな":furigana,"お名前":name,
+                    "顧客ID":customer_id,"注文日":order_date,"受付方法":uketsuke,
+                    "ふりがな":furigana,"お名前":name,
                     "電話番号1":phone1,"電話番号2":phone2,
                     "items":new_items,"備考":notes,
                 }
