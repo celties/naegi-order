@@ -211,7 +211,7 @@ button[data-testid="baseButton-secondary"] {
 """, unsafe_allow_html=True)
 
 # ─── 定数・マスタ読み込み ────────────────────────────────────────
-COLUMNS = ["注文日", "ふりがな", "お名前", "電話番号1", "電話番号2", "品種名", "台木", "本数", "備考"]
+COLUMNS = ["顧客ID", "注文日", "ふりがな", "お名前", "電話番号1", "電話番号2", "品種名", "台木", "本数", "備考"]
 MASTER_EXCEL = os.path.join(os.path.dirname(__file__), "苗木早見表　一覧.xlsx")
 FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash-lite", "gemini-2.0-flash"]
 MODEL_LABELS = {
@@ -284,6 +284,7 @@ def extract_order_from_image(image_bytes, media_type, model):
 品種名・台木・本数は複数行ある場合もあるので、すべて配列に入れてください。{hint_text}
 
 {{
+  "顧客ID": "注文書の右上に記載されている個人ID番号（数字のみ、なければ空文字）",
   "注文日": "元号または西暦の日付文字列",
   "ふりがな": "名前のふりがな",
   "お名前": "漢字の名前",
@@ -318,7 +319,7 @@ JSONのみ返してください。"""
     raise last_err
 
 def flatten_to_rows(form):
-    base = {k: form.get(k, "") for k in ["注文日","ふりがな","お名前","電話番号1","電話番号2","備考"]}
+    base = {k: form.get(k, "") for k in ["顧客ID","注文日","ふりがな","お名前","電話番号1","電話番号2","備考"]}
     rows = []
     for item in form.get("items", [{"品種名":"","台木":"","本数":""}]):
         row = base.copy()
@@ -397,7 +398,7 @@ with col_left:
 
     if st.button("✏️ 手入力で追加", use_container_width=True):
         st.session_state.editing = {
-            "注文日":"","ふりがな":"","お名前":"",
+            "顧客ID":"","注文日":"","ふりがな":"","お名前":"",
             "電話番号1":"","電話番号2":"",
             "items":[{"品種名":"","台木":"","本数":""}],
             "備考":"",
@@ -423,9 +424,10 @@ with col_right:
 
         with st.form("order_form"):
             n_items = len(d.get("items", None) or [{}])
-            r1, r2 = st.columns(2)
-            order_date = r1.text_input("注文日",   value=d.get("注文日",""))
-            furigana   = r2.text_input("ふりがな", value=d.get("ふりがな",""))
+            ri1, ri2, ri3 = st.columns([1, 2, 2])
+            customer_id = ri1.text_input("🔢 顧客ID", value=d.get("顧客ID",""))
+            order_date  = ri2.text_input("注文日",    value=d.get("注文日",""))
+            furigana    = ri3.text_input("ふりがな",  value=d.get("ふりがな",""))
             r3, r4, r5 = st.columns(3)
             name   = r3.text_input("お名前",    value=d.get("お名前",""))
             phone1 = r4.text_input("電話番号1", value=d.get("電話番号1",""))
@@ -448,7 +450,7 @@ with col_right:
 
             if st.form_submit_button("➕ 一覧に追加", type="primary", use_container_width=True):
                 form_data = {
-                    "注文日":order_date,"ふりがな":furigana,"お名前":name,
+                    "顧客ID":customer_id,"注文日":order_date,"ふりがな":furigana,"お名前":name,
                     "電話番号1":phone1,"電話番号2":phone2,
                     "items":new_items,"備考":notes,
                 }
@@ -468,10 +470,32 @@ with col_right:
 
     if st.session_state.orders:
         df = pd.DataFrame(st.session_state.orders, columns=COLUMNS)
-        st.dataframe(df, use_container_width=True, hide_index=False)
+
+        # ── 絞り込み ＆ ソート ──
+        fs1, fs2 = st.columns([2, 3])
+        search_id = fs1.text_input("🔍 顧客IDで絞り込み", placeholder="例: 123", label_visibility="visible")
+        sort_key  = fs2.radio(
+            "並び替え",
+            ["受付順", "顧客ID順", "名前順（あいうえお）", "電話番号順"],
+            horizontal=True,
+            label_visibility="collapsed",
+        )
+
+        df_view = df.copy()
+        if search_id.strip():
+            df_view = df_view[df_view["顧客ID"].astype(str).str.contains(search_id.strip(), na=False)]
+
+        if sort_key == "顧客ID順":
+            df_view = df_view.sort_values("顧客ID", key=lambda s: pd.to_numeric(s, errors="coerce")).reset_index(drop=True)
+        elif sort_key == "名前順（あいうえお）":
+            df_view = df_view.sort_values("ふりがな").reset_index(drop=True)
+        elif sort_key == "電話番号順":
+            df_view = df_view.sort_values("電話番号1").reset_index(drop=True)
+
+        st.dataframe(df_view, use_container_width=True, hide_index=False)
 
         with st.expander("📊 品種別 集計"):
-            df_c = df.copy()
+            df_c = df_view.copy()
             df_c["本数"] = pd.to_numeric(df_c["本数"], errors="coerce")
             summary = df_c.groupby("品種名")["本数"].sum().reset_index()
             summary.columns = ["品種名", "合計本数"]
@@ -480,17 +504,8 @@ with col_right:
 
         st.divider()
         date_str = datetime.now().strftime("%y%m%d")
-        group_by_phone = st.checkbox(
-            "📞 同じ電話番号の注文をまとめて出力する",
-            value=False,
-            help="同じ電話番号の方の注文を隣り合わせに並べてから出力します",
-        )
 
-        df_out = df.copy()
-        if group_by_phone:
-            phone_order = df_out["電話番号1"].unique().tolist()
-            df_out["_rank"] = df_out["電話番号1"].map({p:i for i,p in enumerate(phone_order)})
-            df_out = df_out.sort_values(["_rank","注文日"]).drop(columns=["_rank"]).reset_index(drop=True)
+        df_out = df_view.copy()
 
         c1, c2, c3 = st.columns([2, 2, 1])
 
