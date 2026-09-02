@@ -1,4 +1,6 @@
 import os
+import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 import pandas as pd
 from google import genai
@@ -212,7 +214,7 @@ button[data-testid="baseButton-secondary"] {
 
 # ─── 定数・マスタ読み込み ────────────────────────────────────────
 COLUMNS = ["顧客ID", "注文日", "受付方法", "支払方法", "ふりがな", "お名前",
-           "電話番号1", "電話番号2", "郵便番号", "住所", "品種名", "台木", "本数", "備考"]
+           "電話番号1", "電話番号2", "郵便番号", "住所", "品種名", "台木", "本数", "備考", "元ファイル"]
 UKETSUKE = ["", "電話", "FAX", "メール", "郵便", "来社"]
 SHIHARAI = ["", "郵便振替", "銀行振込", "代金引換", "現金"]
 MASTER_EXCEL = os.path.join(os.path.dirname(__file__), "苗木早見表　一覧.xlsx")
@@ -236,6 +238,8 @@ if "orders" not in st.session_state:
     st.session_state.orders = []
 if "editing" not in st.session_state:
     st.session_state.editing = None
+if "last_failures" not in st.session_state:
+    st.session_state.last_failures = []
 if "master_varieties" not in st.session_state or "master_rootstocks" not in st.session_state:
     st.session_state.master_varieties, st.session_state.master_rootstocks = load_master_from_excel()
 
@@ -252,9 +256,10 @@ def find_closest(name, candidates, threshold=0.4):
     best_score, best_candidate = max(scores)
     return best_candidate if best_score >= threshold else name
 
-def apply_master(items):
-    varieties  = st.session_state.master_varieties
-    rootstocks = st.session_state.master_rootstocks
+def apply_master(items, varieties=None, rootstocks=None):
+    # スレッドから呼ぶ場合は session_state を触れないので引数で渡す
+    if varieties is None:  varieties  = st.session_state.master_varieties
+    if rootstocks is None: rootstocks = st.session_state.master_rootstocks
     result = []
     for item in items:
         corrected = item.copy()
@@ -265,9 +270,20 @@ def apply_master(items):
         result.append(corrected)
     return result
 
-def extract_order_from_image(image_bytes, media_type, model):
-    import os
-    api_key = os.environ.get("GEMINI_API_KEY", "")
+def get_api_key():
+    key = os.environ.get("GEMINI_API_KEY", "")
+    if not key:
+        try:
+            key = st.secrets.get("GEMINI_API_KEY", "")
+        except Exception:
+            key = ""
+    return key
+
+def extract_order_from_image(image_bytes, media_type, model, varieties=None, rootstocks=None):
+    # varieties/rootstocks は並列処理から渡す（session_state はスレッド非対応）
+    if varieties is None:  varieties  = st.session_state.master_varieties
+    if rootstocks is None: rootstocks = st.session_state.master_rootstocks
+    api_key = get_api_key()
     if not api_key:
         raise ValueError(
             "GEMINI_API_KEY が設定されていません。\n"
@@ -275,8 +291,8 @@ def extract_order_from_image(image_bytes, media_type, model):
             "export GEMINI_API_KEY=\"あなたのAPIキー\""
         )
     client = genai.Client(api_key=api_key)
-    variety_hint   = "、".join(st.session_state.master_varieties[:30])
-    rootstock_hint = "、".join(st.session_state.master_rootstocks[:30])
+    variety_hint   = "、".join(varieties)
+    rootstock_hint = "、".join(rootstocks)
     hint_text = ""
     if variety_hint:   hint_text += f"\n品種名の候補: {variety_hint}"
     if rootstock_hint: hint_text += f"\n台木の候補: {rootstock_hint}"
@@ -307,8 +323,13 @@ def extract_order_from_image(image_bytes, media_type, model):
 JSONのみ返してください。"""
 
     image = PIL.Image.open(io.BytesIO(image_bytes))
+    if max(image.size) > 1600:                 # 大きすぎる写真は縮小（速度・コスト対策）
+        image.thumbnail((1600, 1600), PIL.Image.LANCZOS)
+    if image.mode != "RGB":
+        image = image.convert("RGB")
+
     last_err = None
-    for attempt in range(5):
+    for attempt in range(6):
         try:
             response = client.models.generate_content(model=model, contents=[image, prompt])
             raw = response.text.strip()
@@ -319,11 +340,38 @@ JSONのみ返してください。"""
             return json.loads(raw.strip())
         except Exception as e:
             last_err = e
-            if any(x in str(e) for x in ("503","60","timed out","timeout")) and attempt < 4:
-                time.sleep(10 * (attempt + 1))
+            msg = str(e)
+            # 429（レート制限）は長めに、その他の一時エラーは短めに待って再試行
+            if any(x in msg for x in ("429", "RESOURCE_EXHAUSTED", "quota")) and attempt < 5:
+                time.sleep(min(20 * (attempt + 1), 70) + random.uniform(0, 3))
+                continue
+            if any(x in msg for x in ("503", "500", "timed out", "timeout", "Errno 60")) and attempt < 5:
+                time.sleep(5 * (attempt + 1) + random.uniform(0, 2))
                 continue
             raise last_err
     raise last_err
+
+def parse_one_image(name, image_bytes, model, varieties, rootstocks):
+    """写真1枚を解析して行データに変換する。並列実行される（session_state 不可）"""
+    result = extract_order_from_image(image_bytes, "image/jpeg", model, varieties, rootstocks)
+    if isinstance(result, list):
+        result = result[0] if result else {}
+    if not isinstance(result, dict):
+        raise ValueError(f"想定外の応答形式: {type(result).__name__}")
+    items = result.get("items")
+    if isinstance(items, dict):
+        items = [items]
+    elif not isinstance(items, list) or len(items) == 0:
+        items = [{"品種名": "", "台木": "", "本数": ""}]
+    items = [i if isinstance(i, dict) else {"品種名": str(i), "台木": "", "本数": ""} for i in items]
+    # 空行（3項目すべて空）は捨てる
+    items = [i for i in items if any(str(i.get(k, "")).strip() for k in ("品種名", "台木", "本数"))] \
+            or [{"品種名": "", "台木": "", "本数": ""}]
+    result["items"] = apply_master(items, varieties, rootstocks)
+    rows = flatten_to_rows(result)
+    for r in rows:
+        r["元ファイル"] = name
+    return rows
 
 def flatten_to_rows(form):
     base = {k: form.get(k, "") for k in ["顧客ID","注文日","受付方法","支払方法","ふりがな","お名前",
@@ -373,34 +421,80 @@ with col_left:
     uploaded = st.file_uploader(
         "写真を選択",
         type=["jpg", "jpeg", "png", "webp", "heic", "heif"],
+        accept_multiple_files=True,
         label_visibility="collapsed",
     )
 
     if uploaded:
-        st.image(uploaded, use_container_width=True)
-        image_bytes = uploaded.read()
-        ext = uploaded.name.rsplit(".", 1)[-1].lower()
-        media_map = {"jpg":"image/jpeg","jpeg":"image/jpeg","png":"image/png",
-                     "webp":"image/webp","heic":"image/jpeg","heif":"image/jpeg"}
-        media_type = media_map.get(ext, "image/jpeg")
+        n_up = len(uploaded)
+        st.info(f"📸 {n_up}枚を選択中")
+        if n_up > 50:
+            st.warning(
+                f"⚠️ {n_up}枚は一度に処理する量としては多めです。"
+                "途中で止まる場合は50枚以下に分けてお試しください。",
+                icon="⚠️",
+            )
 
-        if st.button("🔍 自動解析する", use_container_width=True, type="primary"):
-            with st.spinner("読み取り中…しばらくお待ちください"):
-                try:
-                    result = extract_order_from_image(image_bytes, media_type, selected_model)
-                    if isinstance(result, list):
-                        result = result[0] if result else {}
-                    items = result.get("items")
-                    if isinstance(items, dict):
-                        items = [items]
-                    elif not isinstance(items, list) or len(items) == 0:
-                        items = [{"品種名":"","台木":"","本数":""}]
-                    items = [i if isinstance(i, dict) else {"品種名":str(i),"台木":"","本数":""} for i in items]
-                    result["items"] = apply_master(items)
-                    st.session_state.editing = result
-                    st.success("✅ 読み取り完了！右側で内容を確認してください。")
-                except Exception as e:
-                    st.error(f"解析エラー: {e}")
+        if n_up == 1:
+            st.image(uploaded[0], use_container_width=True)
+        else:
+            with st.expander(f"選んだ写真を確認（{n_up}枚）"):
+                for f in uploaded[:12]:
+                    st.caption(f.name)
+                if n_up > 12:
+                    st.caption(f"…ほか {n_up - 12} 枚")
+
+        workers = st.slider(
+            "同時に処理する枚数", 1, 8, 4,
+            help="多いほど速くなりますが、APIのレート制限（429エラー）が出やすくなります。"
+                 "429が多発する場合は数を減らしてください。",
+        )
+
+        if st.button(f"🔍 {n_up}枚を一括解析する", use_container_width=True, type="primary"):
+            files = [(f.name, f.getvalue()) for f in uploaded]
+            varieties  = list(st.session_state.master_varieties)
+            rootstocks = list(st.session_state.master_rootstocks)
+
+            bar    = st.progress(0.0, text="解析を開始します…")
+            live   = st.empty()
+            ok_rows, failures, done = [], [], 0
+
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {
+                    ex.submit(parse_one_image, nm, data, selected_model, varieties, rootstocks): nm
+                    for nm, data in files
+                }
+                for fut in as_completed(futs):
+                    nm = futs[fut]
+                    done += 1
+                    try:
+                        ok_rows.extend(fut.result())
+                    except Exception as e:
+                        failures.append((nm, str(e)[:200]))
+                    bar.progress(done / len(files),
+                                 text=f"解析中… {done}/{len(files)}枚（成功 {done-len(failures)} ／ 失敗 {len(failures)}）")
+                    live.caption(f"直近: {nm}")
+
+            bar.empty(); live.empty()
+            st.session_state.orders.extend(ok_rows)
+            st.session_state.last_failures = failures
+
+            n_ok = len(files) - len(failures)
+            if failures:
+                st.warning(f"✅ {n_ok}枚 成功／⚠️ {len(failures)}枚 失敗（{len(ok_rows)}行を追加）")
+            else:
+                st.success(f"✅ {n_ok}枚すべて読み取り完了（{len(ok_rows)}行を追加）")
+            st.rerun()
+
+    if st.session_state.get("last_failures"):
+        with st.expander(f"⚠️ 読み取りに失敗した写真（{len(st.session_state.last_failures)}枚）"):
+            for nm, err in st.session_state.last_failures:
+                st.markdown(f"**{nm}**")
+                st.caption(err)
+            st.caption("失敗した写真だけを選び直して、もう一度アップロードしてください。")
+            if st.button("この一覧を消す"):
+                st.session_state.last_failures = []
+                st.rerun()
 
     st.divider()
 
@@ -546,7 +640,22 @@ with col_right:
         elif sort_key == "電話番号順":
             df_view = df_view.sort_values("電話番号1").reset_index(drop=True)
 
-        st.dataframe(df_view, use_container_width=True, hide_index=False)
+        edit_mode = st.toggle("✏️ 表を直接編集する", value=False,
+                              help="読み取り間違いをこの表の上で直せます。並び替えは「受付順」のときだけ編集できます。")
+
+        if edit_mode and sort_key == "受付順" and not search_id.strip():
+            edited = st.data_editor(
+                df_view, use_container_width=True, num_rows="dynamic",
+                key="order_editor", height=460,
+            )
+            if st.button("💾 編集内容を保存", type="primary", use_container_width=True):
+                st.session_state.orders = edited.fillna("").astype(str).to_dict("records")
+                st.success("保存しました。")
+                st.rerun()
+        else:
+            if edit_mode:
+                st.caption("⚠️ 編集するには並び替えを「受付順」にして、IDの絞り込みを空にしてください。")
+            st.dataframe(df_view, use_container_width=True, hide_index=False, height=460)
 
         with st.expander("📊 品種別 集計"):
             df_c = df_view.copy()
