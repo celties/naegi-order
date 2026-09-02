@@ -1,4 +1,5 @@
 import os
+import re
 import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
@@ -240,6 +241,8 @@ if "editing" not in st.session_state:
     st.session_state.editing = None
 if "last_failures" not in st.session_state:
     st.session_state.last_failures = []
+if "quota_hit" not in st.session_state:
+    st.session_state.quota_hit = None
 if "master_varieties" not in st.session_state or "master_rootstocks" not in st.session_state:
     st.session_state.master_varieties, st.session_state.master_rootstocks = load_master_from_excel()
 
@@ -269,6 +272,21 @@ def apply_master(items, varieties=None, rootstocks=None):
             corrected["台木"] = find_closest(item.get("台木", ""), rootstocks)
         result.append(corrected)
     return result
+
+class QuotaExhausted(Exception):
+    """APIの利用枠切れ。待っても回復しないので一括処理を打ち切る"""
+
+def is_daily_quota(msg):
+    """1日あたりの上限（待っても回復しない）かどうかを判定する"""
+    m = msg.replace(" ", "")
+    return any(k in m for k in ("PerDay", "perday", "PerProjectPerDay", "FreeTier"))
+
+def retry_delay_of(msg, default=20):
+    """APIが返す retryDelay（例 '38s'）を秒数として取り出す"""
+    m = re.search(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+)s", msg)
+    if m:
+        return min(int(m.group(1)) + 2, 70)
+    return default
 
 def get_api_key():
     key = os.environ.get("GEMINI_API_KEY", "")
@@ -341,10 +359,15 @@ JSONのみ返してください。"""
         except Exception as e:
             last_err = e
             msg = str(e)
-            # 429（レート制限）は長めに、その他の一時エラーは短めに待って再試行
-            if any(x in msg for x in ("429", "RESOURCE_EXHAUSTED", "quota")) and attempt < 5:
-                time.sleep(min(20 * (attempt + 1), 70) + random.uniform(0, 3))
-                continue
+            if any(x in msg for x in ("429", "RESOURCE_EXHAUSTED", "quota")):
+                if is_daily_quota(msg):
+                    # 1日の上限。待っても回復しないので即座に打ち切る
+                    raise QuotaExhausted("本日の利用上限に達しました") from e
+                if attempt < 5:
+                    time.sleep(retry_delay_of(msg, default=15 * (attempt + 1))
+                               + random.uniform(0, 3))
+                    continue
+                raise QuotaExhausted("短時間に送りすぎて制限中です") from e
             if any(x in msg for x in ("503", "500", "timed out", "timeout", "Errno 60")) and attempt < 5:
                 time.sleep(5 * (attempt + 1) + random.uniform(0, 2))
                 continue
@@ -445,9 +468,9 @@ with col_left:
                     st.caption(f"…ほか {n_up - 12} 枚")
 
         workers = st.slider(
-            "同時に処理する枚数", 1, 8, 4,
-            help="多いほど速くなりますが、APIのレート制限（429エラー）が出やすくなります。"
-                 "429が多発する場合は数を減らしてください。",
+            "同時に処理する枚数", 1, 8, 2,
+            help="多いほど速くなりますが、APIの制限に当たりやすくなります。"
+                 "無料プランなら2以下、有料プランなら4〜8がおすすめです。",
         )
 
         if st.button(f"🔍 {n_up}枚を一括解析する", use_container_width=True, type="primary"):
@@ -458,6 +481,7 @@ with col_left:
             bar    = st.progress(0.0, text="解析を開始します…")
             live   = st.empty()
             ok_rows, failures, done = [], [], 0
+            quota_hit = None
 
             with ThreadPoolExecutor(max_workers=workers) as ex:
                 futs = {
@@ -469,6 +493,11 @@ with col_left:
                     done += 1
                     try:
                         ok_rows.extend(fut.result())
+                    except QuotaExhausted as e:
+                        quota_hit = str(e)
+                        failures.append((nm, "APIの利用枠切れ"))
+                        for f2 in futs:            # 残りは投げても無駄なので取り消す
+                            f2.cancel()
                     except Exception as e:
                         failures.append((nm, str(e)[:200]))
                     bar.progress(done / len(files),
@@ -478,12 +507,30 @@ with col_left:
             bar.empty(); live.empty()
             st.session_state.orders.extend(ok_rows)
             st.session_state.last_failures = failures
+            st.session_state.quota_hit = quota_hit
 
             n_ok = len(files) - len(failures)
-            if failures:
+            if quota_hit:
+                st.error(f"🚫 {quota_hit}ため、途中で中断しました（{n_ok}枚成功・{len(ok_rows)}行を追加）")
+            elif failures:
                 st.warning(f"✅ {n_ok}枚 成功／⚠️ {len(failures)}枚 失敗（{len(ok_rows)}行を追加）")
             else:
                 st.success(f"✅ {n_ok}枚すべて読み取り完了（{len(ok_rows)}行を追加）")
+            st.rerun()
+
+    if st.session_state.get("quota_hit"):
+        st.error(
+            f"**🚫 {st.session_state.quota_hit}**\n\n"
+            "AIの読み取り回数が上限に達しました。次のどれかで解決します：\n\n"
+            "1. **別のモデルに切り替える** — 画面上部の「使用モデル」を変えると、"
+            "モデルごとに枠が分かれているため続けられる場合があります\n"
+            "2. **しばらく待つ** — 1分あたりの制限なら1〜2分で回復します\n"
+            "3. **翌日まで待つ** — 1日の上限の場合は日付が変わると回復します\n"
+            "4. **有料プランにする** — 毎日たくさん処理するならこれが確実です\n\n"
+            "※ すでに読み取れた分は下の一覧に残っています。失敗した写真だけ選び直してください。"
+        )
+        if st.button("この案内を閉じる"):
+            st.session_state.quota_hit = None
             st.rerun()
 
     if st.session_state.get("last_failures"):
