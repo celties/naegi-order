@@ -211,8 +211,10 @@ button[data-testid="baseButton-secondary"] {
 """, unsafe_allow_html=True)
 
 # ─── 定数・マスタ読み込み ────────────────────────────────────────
-COLUMNS = ["顧客ID", "注文日", "受付方法", "ふりがな", "お名前", "電話番号1", "電話番号2", "品種名", "台木", "本数", "備考"]
+COLUMNS = ["顧客ID", "注文日", "受付方法", "支払方法", "ふりがな", "お名前",
+           "電話番号1", "電話番号2", "郵便番号", "住所", "品種名", "台木", "本数", "備考"]
 UKETSUKE = ["", "電話", "FAX", "メール", "郵便", "来社"]
+SHIHARAI = ["", "郵便振替", "銀行振込", "代金引換", "現金"]
 MASTER_EXCEL = os.path.join(os.path.dirname(__file__), "苗木早見表　一覧.xlsx")
 FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash-lite", "gemini-2.0-flash"]
 MODEL_LABELS = {
@@ -285,13 +287,16 @@ def extract_order_from_image(image_bytes, media_type, model):
 品種名・台木・本数は複数行ある場合もあるので、すべて配列に入れてください。{hint_text}
 
 {{
-  "顧客ID": "注文書の右上「No.」欄に記載されている個人ID番号（数字のみ、なければ空文字）",
+  "顧客ID": "右上の「No.」または「配送No.」欄に記載されている番号（数字のみ、なければ空文字）",
   "注文日": "元号または西暦の日付文字列",
   "受付方法": "注文日の右にある「電話・FAX・メール／郵便・来社」のうち丸で囲まれた、または選択されているもの1つ（電話/FAX/メール/郵便/来社のいずれか。判別できなければ空文字）",
+  "支払方法": "最下部「お支払い方法」でチェックが入っているもの1つ（郵便振替/銀行振込/代金引換/現金のいずれか。なければ空文字）",
   "ふりがな": "名前のふりがな",
   "お名前": "漢字の名前",
   "電話番号1": "電話番号1",
   "電話番号2": "電話番号2（なければ空文字）",
+  "郵便番号": "ご住所欄の「〒」の後に書かれた郵便番号（例 405-0018。なければ空文字）",
+  "住所": "ご住所欄の住所（郵便番号は含めない。なければ空文字）",
   "items": [
     {{"品種名": "品種名", "台木": "台木", "本数": "本数（数字）"}},
     {{"品種名": "...",    "台木": "...", "本数": "..."}}
@@ -321,7 +326,8 @@ JSONのみ返してください。"""
     raise last_err
 
 def flatten_to_rows(form):
-    base = {k: form.get(k, "") for k in ["顧客ID","注文日","受付方法","ふりがな","お名前","電話番号1","電話番号2","備考"]}
+    base = {k: form.get(k, "") for k in ["顧客ID","注文日","受付方法","支払方法","ふりがな","お名前",
+                                         "電話番号1","電話番号2","郵便番号","住所","備考"]}
     rows = []
     for item in form.get("items", [{"品種名":"","台木":"","本数":""}]):
         row = base.copy()
@@ -400,11 +406,41 @@ with col_left:
 
     if st.button("✏️ 手入力で追加", use_container_width=True):
         st.session_state.editing = {
-            "顧客ID":"","注文日":"","受付方法":"","ふりがな":"","お名前":"",
-            "電話番号1":"","電話番号2":"",
+            "顧客ID":"","注文日":"","受付方法":"","支払方法":"",
+            "ふりがな":"","お名前":"",
+            "電話番号1":"","電話番号2":"","郵便番号":"","住所":"",
             "items":[{"品種名":"","台木":"","本数":""}],
             "備考":"",
         }
+
+    with st.expander("📂 CSV・Excelから取り込む"):
+        st.caption("以前に出力した一覧や、テスト用データを読み込めます")
+        imp = st.file_uploader("取り込むファイル", type=["csv", "xlsx"],
+                               key="importer", label_visibility="collapsed")
+        mode = st.radio("取り込み方法", ["既存の一覧に追加", "既存を置き換える"],
+                        horizontal=True, key="import_mode")
+        if imp is not None and st.button("📥 このファイルを取り込む", use_container_width=True, type="primary"):
+            try:
+                if imp.name.lower().endswith(".csv"):
+                    df_in = pd.read_csv(imp, dtype=str, encoding="utf-8-sig").fillna("")
+                else:
+                    df_in = pd.read_excel(imp, dtype=str).fillna("")
+                missing = [c for c in COLUMNS if c not in df_in.columns]
+                for c in missing:
+                    df_in[c] = ""
+                df_in = df_in[COLUMNS]
+                new_rows = df_in.to_dict("records")
+                if mode == "既存を置き換える":
+                    st.session_state.orders = new_rows
+                else:
+                    st.session_state.orders.extend(new_rows)
+                msg = f"✅ {len(new_rows)}件を取り込みました。"
+                if missing:
+                    msg += f"（ファイルに無かった列は空欄：{'・'.join(missing)}）"
+                st.success(msg)
+                st.rerun()
+            except Exception as e:
+                st.error(f"取り込みエラー: {e}")
 
     with st.expander("🔧 使用できるモデルを確認"):
         if st.button("モデル一覧を取得"):
@@ -426,19 +462,27 @@ with col_right:
 
         with st.form("order_form"):
             n_items = len(d.get("items", None) or [{}])
-            ri1, ri2, ri3, ri4 = st.columns([1, 2, 1.3, 2])
+            ri1, ri2, ri3, ri4 = st.columns([1, 2, 1.4, 1.4])
             customer_id = ri1.text_input("🔢 顧客ID", value=d.get("顧客ID",""))
             order_date  = ri2.text_input("注文日",    value=d.get("注文日",""))
             _uke = str(d.get("受付方法","") or "").strip()
-            uketsuke = ri3.selectbox(
-                "受付方法", UKETSUKE,
-                index=UKETSUKE.index(_uke) if _uke in UKETSUKE else 0,
-            )
-            furigana    = ri4.text_input("ふりがな",  value=d.get("ふりがな",""))
-            r3, r4, r5 = st.columns(3)
-            name   = r3.text_input("お名前",    value=d.get("お名前",""))
-            phone1 = r4.text_input("電話番号1", value=d.get("電話番号1",""))
-            phone2 = r5.text_input("電話番号2", value=d.get("電話番号2",""))
+            uketsuke = ri3.selectbox("受付方法", UKETSUKE,
+                index=UKETSUKE.index(_uke) if _uke in UKETSUKE else 0)
+            _shi = str(d.get("支払方法","") or "").strip()
+            shiharai = ri4.selectbox("支払方法", SHIHARAI,
+                index=SHIHARAI.index(_shi) if _shi in SHIHARAI else 0)
+
+            r1, r2 = st.columns(2)
+            furigana = r1.text_input("ふりがな", value=d.get("ふりがな",""))
+            name     = r2.text_input("お名前",   value=d.get("お名前",""))
+
+            r3, r4 = st.columns(2)
+            phone1 = r3.text_input("電話番号1", value=d.get("電話番号1",""))
+            phone2 = r4.text_input("電話番号2", value=d.get("電話番号2",""))
+
+            r5, r6 = st.columns([1, 3])
+            postal  = r5.text_input("〒 郵便番号", value=d.get("郵便番号",""))
+            address = r6.text_input("ご住所",     value=d.get("住所",""))
 
             st.markdown("**ご注文内容**")
             h1, h2, h3 = st.columns([3, 2, 1])
@@ -457,9 +501,11 @@ with col_right:
 
             if st.form_submit_button("➕ 一覧に追加", type="primary", use_container_width=True):
                 form_data = {
-                    "顧客ID":customer_id,"注文日":order_date,"受付方法":uketsuke,
+                    "顧客ID":customer_id,"注文日":order_date,
+                    "受付方法":uketsuke,"支払方法":shiharai,
                     "ふりがな":furigana,"お名前":name,
                     "電話番号1":phone1,"電話番号2":phone2,
+                    "郵便番号":postal,"住所":address,
                     "items":new_items,"備考":notes,
                 }
                 st.session_state.orders.extend(flatten_to_rows(form_data))
