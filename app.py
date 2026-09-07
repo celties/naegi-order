@@ -221,11 +221,20 @@ COLUMNS = ["顧客ID", "注文日", "受付方法", "支払方法", "ふりが�
 UKETSUKE = ["", "電話", "FAX", "メール", "郵便", "来社"]
 SHIHARAI = ["", "郵便振替", "銀行振込", "代金引換", "現金"]
 MASTER_EXCEL = os.path.join(os.path.dirname(__file__), "苗木早見表　一覧.xlsx")
-FALLBACK_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash-lite", "gemini-2.0-flash"]
+# 枠切れ・廃止のときは上から順に自動で切り替わる
+FALLBACK_MODELS = [
+    "gemini-3.1-flash-lite",
+    "gemini-3.8-flash",
+    "gemini-2.5-flash",
+    "gemini-3.5-flash",
+    "gemini-flash-latest",
+]
 MODEL_LABELS = {
-    "gemini-2.5-flash":    "Gemini 2.5 Flash（高精度・推奨）",
-    "gemini-2.0-flash-lite": "Gemini 2.0 Flash Lite（軽量）",
-    "gemini-2.0-flash":    "Gemini 2.0 Flash",
+    "gemini-3.1-flash-lite": "Gemini 3.1 Flash Lite（最速・推奨）",
+    "gemini-3.8-flash":      "Gemini 3.8 Flash（最新・高精度）",
+    "gemini-2.5-flash":      "Gemini 2.5 Flash（安定）",
+    "gemini-3.5-flash":      "Gemini 3.5 Flash",
+    "gemini-flash-latest":   "Gemini Flash 最新版（自動追従）",
 }
 
 def load_master_from_excel():
@@ -279,6 +288,14 @@ def apply_master(items, varieties=None, rootstocks=None):
 
 class QuotaExhausted(Exception):
     """APIの利用枠切れ。待っても回復しないので一括処理を打ち切る"""
+
+class ModelUnavailable(Exception):
+    """モデルが廃止・未提供。次のモデルへ切り替える"""
+
+def is_model_gone(msg):
+    m = msg.replace(" ", "")
+    return ("404" in m and any(k in m for k in ("NOT_FOUND", "notfound", "models/"))) \
+        or "is not found" in msg or "利用できなくなりました" in msg
 
 def is_daily_quota(msg):
     """1日あたりの上限（待っても回復しない）かどうかを判定する"""
@@ -375,6 +392,8 @@ JSONのみ返してください。"""
         except Exception as e:
             last_err = e
             msg = str(e)
+            if is_model_gone(msg):
+                raise ModelUnavailable(f"モデル {model} は利用できません") from e
             if any(x in msg for x in ("429", "RESOURCE_EXHAUSTED", "quota")):
                 if is_daily_quota(msg):
                     # 1日の上限。待っても回復しないので即座に打ち切る
@@ -617,7 +636,7 @@ with col_left:
                         nm, data = futs[fut]
                         try:
                             ok_rows.extend(fut.result())
-                        except QuotaExhausted as e:
+                        except (QuotaExhausted, ModelUnavailable) as e:
                             quota_hit = str(e)
                             retry_next.append((nm, data))   # 次のモデルで再挑戦する
                             for f2 in futs:
@@ -658,7 +677,7 @@ with col_left:
     if st.session_state.get("quota_hit"):
         st.error(
             f"**🚫 {st.session_state.quota_hit}**\n\n"
-            "AIの読み取り回数が上限に達しました。次のどれかで解決します：\n\n"
+            "AIが使えない状態です。次のどれかで解決します：\n\n"
             "1. **別のモデルに切り替える** — 画面上部の「使用モデル」を変えると、"
             "モデルごとに枠が分かれているため続けられる場合があります\n"
             "2. **しばらく待つ** — 1分あたりの制限なら1〜2分で回復します\n"
