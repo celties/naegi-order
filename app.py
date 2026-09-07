@@ -6,6 +6,8 @@ import streamlit as st
 import pandas as pd
 from google import genai
 import PIL.Image
+import PIL.ImageDraw
+import PIL.ImageFont
 import json
 import io
 import time
@@ -243,6 +245,8 @@ if "last_failures" not in st.session_state:
     st.session_state.last_failures = []
 if "quota_hit" not in st.session_state:
     st.session_state.quota_hit = None
+if "print_bytes" not in st.session_state:
+    st.session_state.print_bytes = None
 if "master_varieties" not in st.session_state or "master_rootstocks" not in st.session_state:
     st.session_state.master_varieties, st.session_state.master_rootstocks = load_master_from_excel()
 
@@ -318,7 +322,19 @@ def extract_order_from_image(image_bytes, media_type, model, varieties=None, roo
     prompt = f"""この画像は苗木の注文書です。
 以下のJSON形式で情報を読み取ってください。
 読み取れない項目は空文字にしてください。
-品種名・台木・本数は複数行ある場合もあるので、すべて配列に入れてください。{hint_text}
+品種名・台木・本数は複数行ある場合もあるので、すべて配列に入れてください。
+
+【電話番号の読み取り注意】
+・電話番号欄には「－」（ハイフン）があらかじめ印刷されています。
+　この印刷されたハイフンは区切り記号であり、数字ではありません。
+　絶対に 1 や 7 などの数字として読み取らないでください。
+・電話番号欄には電話番号が最大2件書かれていることがあります。
+　左側（上段）を電話番号1、右側（下段）を電話番号2としてください。
+・出力は必ず半角数字とハイフンのみにし、
+　「0553-22-1487」のような形式に整えてください。
+・空欄のハイフンだけが残っている場合、その電話番号は空文字にしてください。
+　（例：「－　　－」しか無い＝未記入なので空文字）
+{hint_text}
 
 {{
   "顧客ID": "右上の「No.」または「配送No.」欄に記載されている番号（数字のみ、なければ空文字）",
@@ -327,8 +343,8 @@ def extract_order_from_image(image_bytes, media_type, model, varieties=None, roo
   "支払方法": "最下部「お支払い方法」でチェックが入っているもの1つ（郵便振替/銀行振込/代金引換/現金のいずれか。なければ空文字）",
   "ふりがな": "名前のふりがな",
   "お名前": "漢字の名前",
-  "電話番号1": "電話番号1",
-  "電話番号2": "電話番号2（なければ空文字）",
+  "電話番号1": "電話番号欄の1つめの電話番号",
+  "電話番号2": "電話番号欄の2つめの電話番号（1つしか無ければ空文字）",
   "郵便番号": "ご住所欄の「〒」の後に書かれた郵便番号（例 405-0018。なければ空文字）",
   "住所": "ご住所欄の住所（郵便番号は含めない。なければ空文字）",
   "items": [
@@ -396,9 +412,20 @@ def parse_one_image(name, image_bytes, model, varieties, rootstocks):
         r["元ファイル"] = name
     return rows
 
+def clean_phone(v):
+    """電話番号を半角数字とハイフンだけに整える。未記入はハイフンだけ残るので空にする"""
+    s = unicodedata.normalize("NFKC", str(v or "")).strip()
+    s = re.sub(r"[^0-9\-]", "", s)          # 数字とハイフン以外を除去
+    s = re.sub(r"-{2,}", "-", s).strip("-")  # 連続ハイフン・前後のハイフンを整理
+    return "" if not re.search(r"\d", s) else s
+
 def flatten_to_rows(form):
     base = {k: form.get(k, "") for k in ["顧客ID","注文日","受付方法","支払方法","ふりがな","お名前",
                                          "電話番号1","電話番号2","郵便番号","住所","備考"]}
+    base["電話番号1"] = clean_phone(base["電話番号1"])
+    base["電話番号2"] = clean_phone(base["電話番号2"])
+    if not base["電話番号1"] and base["電話番号2"]:   # 1が空で2だけある場合は詰める
+        base["電話番号1"], base["電話番号2"] = base["電話番号2"], ""
     rows = []
     for item in form.get("items", [{"品種名":"","台木":"","本数":""}]):
         row = base.copy()
@@ -407,6 +434,92 @@ def flatten_to_rows(form):
         row["本数"]   = item.get("本数", "")
         rows.append(row)
     return rows
+
+
+# ─── 印刷用 PDF / TIFF の生成 ───────────────────────────────────
+FONT_CANDIDATES = [
+    os.path.join(os.path.dirname(__file__), "fonts", "NotoSansJP-Regular.otf"),
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+    "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+]
+
+@st.cache_resource
+def _font_path():
+    for p in FONT_CANDIDATES:
+        if os.path.exists(p):
+            try:
+                PIL.ImageFont.truetype(p, 20)
+                return p
+            except Exception:
+                continue
+    return None
+
+def _fnt(size):
+    p = _font_path()
+    return PIL.ImageFont.truetype(p, size) if p else PIL.ImageFont.load_default()
+
+def render_table_pages(df, title, dpi=150):
+    """一覧表を A4横のページ画像（複数枚）に描画する"""
+    W, H = int(11.69 * dpi), int(8.27 * dpi)      # A4横
+    M = int(0.4 * dpi)                            # 余白
+    f_title, f_head, f_cell = _fnt(26), _fnt(15), _fnt(14)
+
+    cols = [c for c in df.columns if c != "元ファイル"]
+    probe = PIL.Image.new("RGB", (10, 10)); pd_ = PIL.ImageDraw.Draw(probe)
+    # 列幅は「見出しと中身の実際の描画幅」から決め、全体を紙幅に収める
+    raw = []
+    for c in cols:
+        w = pd_.textlength(str(c), font=f_head)
+        for v in df[c].astype(str).head(400):
+            w = max(w, pd_.textlength(v[:22], font=f_cell))
+        raw.append(w + 16)
+    scale = (W - 2 * M) / sum(raw)
+    widths = [max(w * scale, 26) for w in raw]
+
+    RH, HH = int(0.19 * dpi), int(0.24 * dpi)
+    rows_per_page = max(1, (H - 2 * M - int(0.42 * dpi) - HH) // RH)
+    chunks = [df.iloc[i:i + rows_per_page] for i in range(0, len(df), rows_per_page)] or [df]
+
+    pages = []
+    for pno, chunk in enumerate(chunks, 1):
+        img = PIL.Image.new("RGB", (W, H), "white")
+        d = PIL.ImageDraw.Draw(img)
+        d.text((M, M - 6), title, font=f_title, fill="black")
+        d.text((W - M - 190, M + 4), f"{pno} / {len(chunks)} ページ", font=f_cell, fill="black")
+
+        y = M + int(0.42 * dpi)
+        d.rectangle([M, y, M + sum(widths), y + HH], fill=(226, 240, 228))
+        x = M
+        for c, w in zip(cols, widths):
+            d.text((x + 6, y + HH / 2 - 9), str(c), font=f_head, fill="black")
+            x += w
+        y += HH
+
+        for _, row in chunk.iterrows():
+            x = M
+            for c, w in zip(cols, widths):
+                txt = str(row[c])
+                while txt and d.textlength(txt, font=f_cell) > w - 10:
+                    txt = txt[:-1]                     # 列からはみ出さないよう末尾を切る
+                d.text((x + 6, y + RH / 2 - 9), txt, font=f_cell, fill="black")
+                d.line([(x, y), (x, y + RH)], fill=(190, 190, 190), width=1)
+                x += w
+            d.line([(M, y + RH), (M + sum(widths), y + RH)], fill=(190, 190, 190), width=1)
+            y += RH
+
+        d.rectangle([M, M + int(0.42 * dpi), M + sum(widths), y], outline="black", width=2)
+        pages.append(img)
+    return pages
+
+def pages_to_bytes(pages, fmt):
+    buf = io.BytesIO()
+    if fmt == "PDF":
+        pages[0].save(buf, "PDF", resolution=150.0, save_all=True, append_images=pages[1:])
+    else:  # TIFF（複数ページ・可逆圧縮）
+        pages[0].save(buf, "TIFF", save_all=True, append_images=pages[1:],
+                      compression="tiff_deflate", dpi=(150, 150))
+    return buf.getvalue()
 
 
 # ─── 設定バー（モデル選択 ＋ マスタ状態） ────────────────────────
@@ -478,44 +591,68 @@ with col_left:
             varieties  = list(st.session_state.master_varieties)
             rootstocks = list(st.session_state.master_rootstocks)
 
-            bar    = st.progress(0.0, text="解析を開始します…")
-            live   = st.empty()
-            ok_rows, failures, done = [], [], 0
+            # 選んだモデルから順に、枠切れしたら自動で次のモデルへ降格して続行する
+            chain = [selected_model] + [m for m in FALLBACK_MODELS if m != selected_model]
+            bar, live = st.progress(0.0, text="解析を開始します…"), st.empty()
+
+            ok_rows, failures, downgrades = [], [], []
+            pending = list(files)          # まだ成功していない写真
+            total   = len(files)
             quota_hit = None
 
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {
-                    ex.submit(parse_one_image, nm, data, selected_model, varieties, rootstocks): nm
-                    for nm, data in files
-                }
-                for fut in as_completed(futs):
-                    nm = futs[fut]
-                    done += 1
-                    try:
-                        ok_rows.extend(fut.result())
-                    except QuotaExhausted as e:
-                        quota_hit = str(e)
-                        failures.append((nm, "APIの利用枠切れ"))
-                        for f2 in futs:            # 残りは投げても無駄なので取り消す
-                            f2.cancel()
-                    except Exception as e:
-                        failures.append((nm, str(e)[:200]))
-                    bar.progress(done / len(files),
-                                 text=f"解析中… {done}/{len(files)}枚（成功 {done-len(failures)} ／ 失敗 {len(failures)}）")
-                    live.caption(f"直近: {nm}")
+            for mi, model_name in enumerate(chain):
+                if not pending:
+                    break
+                if mi > 0:
+                    downgrades.append(model_name)
+                    live.warning(f"⚠️ 枠切れのため「{MODEL_LABELS.get(model_name, model_name)}」"
+                                 f"に切り替えて残り{len(pending)}枚を続行します…")
+
+                retry_next, quota_hit = [], None
+                with ThreadPoolExecutor(max_workers=workers) as ex:
+                    futs = {ex.submit(parse_one_image, nm, data, model_name,
+                                      varieties, rootstocks): (nm, data)
+                            for nm, data in pending}
+                    for fut in as_completed(futs):
+                        nm, data = futs[fut]
+                        try:
+                            ok_rows.extend(fut.result())
+                        except QuotaExhausted as e:
+                            quota_hit = str(e)
+                            retry_next.append((nm, data))   # 次のモデルで再挑戦する
+                            for f2 in futs:
+                                f2.cancel()
+                        except Exception as e:
+                            failures.append((nm, str(e)[:200]))
+                        n_done = len({r["元ファイル"] for r in ok_rows}) + len(failures)
+                        bar.progress(min(n_done / total, 1.0),
+                                     text=f"解析中…（{MODEL_LABELS.get(model_name, model_name)}）"
+                                          f" {n_done}/{total}枚　成功 {n_done - len(failures)} ／ 失敗 {len(failures)}")
+
+                # キャンセルされて未処理のまま残ったものも次のモデルへ回す
+                done_names = {r["元ファイル"] for r in ok_rows} | {n for n, _ in failures}
+                pending = [(nm, data) for nm, data in pending if nm not in done_names]
+                if not quota_hit:
+                    break                      # 枠切れ以外なら降格せず終了
 
             bar.empty(); live.empty()
+            for nm, _ in pending:              # 全モデル試しても駄目だった分
+                failures.append((nm, "全モデルで利用枠切れ"))
+
             st.session_state.orders.extend(ok_rows)
             st.session_state.last_failures = failures
-            st.session_state.quota_hit = quota_hit
+            st.session_state.quota_hit = quota_hit if pending else None
 
-            n_ok = len(files) - len(failures)
-            if quota_hit:
-                st.error(f"🚫 {quota_hit}ため、途中で中断しました（{n_ok}枚成功・{len(ok_rows)}行を追加）")
+            n_ok = len({r["元ファイル"] for r in ok_rows})
+            note = ""
+            if downgrades:
+                note = f"（枠切れのため {'→'.join(MODEL_LABELS.get(m, m) for m in downgrades)} に自動切替）"
+            if pending:
+                st.error(f"🚫 全モデルで利用枠に達しました。{n_ok}枚成功・{len(pending)}枚未処理{note}")
             elif failures:
-                st.warning(f"✅ {n_ok}枚 成功／⚠️ {len(failures)}枚 失敗（{len(ok_rows)}行を追加）")
+                st.warning(f"✅ {n_ok}枚 成功／⚠️ {len(failures)}枚 失敗（{len(ok_rows)}行を追加）{note}")
             else:
-                st.success(f"✅ {n_ok}枚すべて読み取り完了（{len(ok_rows)}行を追加）")
+                st.success(f"✅ {n_ok}枚すべて読み取り完了（{len(ok_rows)}行を追加）{note}")
             st.rerun()
 
     if st.session_state.get("quota_hit"):
@@ -747,6 +884,36 @@ with col_right:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
         )
+
+        # ── 印刷用（PDF / TIFF）──
+        st.markdown("**🖨️ 印刷用ファイル**")
+        p1, p2 = st.columns([1, 3])
+        out_fmt = p1.radio("形式", ["PDF", "TIFF"], horizontal=True,
+                           key="print_fmt", label_visibility="collapsed")
+        with p2:
+            if _font_path() is None:
+                st.error("日本語フォントが見つからないため、印刷用ファイルを作れません。")
+            elif st.button(f"🖨️ {out_fmt} を作成する", use_container_width=True):
+                with st.spinner(f"{out_fmt} を作成中…"):
+                    try:
+                        pages = render_table_pages(
+                            df_out, f"前島園芸 苗木注文書一覧（{len(df_out)}件）")
+                        st.session_state.print_bytes = pages_to_bytes(pages, out_fmt)
+                        st.session_state.print_ext   = "pdf" if out_fmt == "PDF" else "tif"
+                        st.session_state.print_pages = len(pages)
+                    except Exception as e:
+                        st.error(f"作成に失敗しました: {e}")
+
+        if st.session_state.get("print_bytes"):
+            ext = st.session_state.print_ext
+            st.download_button(
+                f"📥 {ext.upper()}をダウンロード（{st.session_state.print_pages}ページ）",
+                data=st.session_state.print_bytes,
+                file_name=f"前島園芸苗注文書一覧_{date_str}.{ext}",
+                mime="application/pdf" if ext == "pdf" else "image/tiff",
+                use_container_width=True,
+                type="primary",
+            )
 
         if c3.button("🗑️ 全削除", use_container_width=True):
             st.session_state.orders = []
