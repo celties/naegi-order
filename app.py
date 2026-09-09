@@ -721,7 +721,7 @@ with col_left:
                 "読み取れた分は一覧に残るので、残りを選び直してください。"
             )
         elif n_up >= 20:
-            st.info(f"📋 {n_up}枚を読み取ります。おおよそ {max(1, round(n_up * 2.5 / 60))}分ほどかかります。"
+            st.info(f"📋 {n_up}枚を読み取ります。おおよそ {max(1, round(n_up * 3 / 60))}分ほどかかります。"
                     "終わるまで画面を閉じないでください。")
 
         if n_up == 1:
@@ -733,11 +733,9 @@ with col_left:
                 if n_up > 12:
                     st.caption(f"…ほか {n_up - 12} 枚")
 
-        workers = st.slider(
-            "同時に処理する枚数", 1, 8, 2,
-            help="多いほど速くなりますが、APIの制限に当たりやすくなります。"
-                 "無料プランなら2以下、有料プランなら4〜8がおすすめです。",
-        )
+        # 同時送信数。APIの制限に当たらないよう1枚ずつ確実に処理する。
+        # 速度を上げたい場合はここを増やす（有料プランなら4〜8が目安）。
+        workers = 1
 
         if n_up and st.button(f"🔍 {n_up}枚を一括解析する", use_container_width=True, type="primary"):
             files = list(pages)
