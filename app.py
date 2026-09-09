@@ -581,15 +581,16 @@ def pages_to_bytes(pages, fmt):
 
 # ─── スキャンPDF・複数ページTIFFを1枚ずつの画像に展開する ─────────
 PAGE_TYPES = ["jpg", "jpeg", "png", "webp", "heic", "heif", "pdf", "tif", "tiff"]
-MAX_PAGES = 300          # 事故防止の上限
+MAX_PAGES = 150          # メモリ実測に基づく上限（超えるとStreamlit Cloudが落ちる）
 
 def pdf_to_images(data, dpi=200):
     """複合機でまとめてスキャンしたPDFを1ページ=1枚のJPEGに分解する"""
     import pypdfium2 as pdfium
     out = []
     pdf = pdfium.PdfDocument(data)
+    total = len(pdf)
     try:
-        for i in range(min(len(pdf), MAX_PAGES)):
+        for i in range(min(total, MAX_PAGES)):
             img = pdf[i].render(scale=dpi / 72).to_pil().convert("RGB")
             if max(img.size) > 1600:          # 送信サイズを抑える
                 img.thumbnail((1600, 1600), PIL.Image.LANCZOS)
@@ -598,13 +599,14 @@ def pdf_to_images(data, dpi=200):
             out.append(buf.getvalue())
     finally:
         pdf.close()
-    return out
+    return out, total
 
 def tiff_to_images(data):
     """複数ページTIFFを1ページずつに分解する"""
     out = []
     img = PIL.Image.open(io.BytesIO(data))
-    for i in range(min(getattr(img, "n_frames", 1), MAX_PAGES)):
+    total = getattr(img, "n_frames", 1)
+    for i in range(min(total, MAX_PAGES)):
         img.seek(i)
         page = img.convert("RGB")
         if max(page.size) > 1600:
@@ -612,7 +614,7 @@ def tiff_to_images(data):
         buf = io.BytesIO()
         page.save(buf, "JPEG", quality=88)
         out.append(buf.getvalue())
-    return out
+    return out, total
 
 def expand_uploads(files):
     """アップロードされたファイル群を (表示名, 画像バイト列) の一覧に展開する。
@@ -624,15 +626,23 @@ def expand_uploads(files):
         data = f.getvalue()
         try:
             if ext == "pdf":
-                imgs = pdf_to_images(data)
+                imgs, total = pdf_to_images(data)
                 if not imgs:
                     raise ValueError("ページが読み取れませんでした")
                 for i, b in enumerate(imgs, 1):
                     pages.append((f"{name}#{i}ページ目", b))
+                if total > len(imgs):
+                    errors.append((name, f"{total}ページありますが、一度に処理できるのは"
+                                         f"{MAX_PAGES}ページまでです。{len(imgs)+1}ページ目以降は"
+                                         f"読み込んでいません。分割してお試しください。"))
             elif ext in ("tif", "tiff"):
-                imgs = tiff_to_images(data)
+                imgs, total = tiff_to_images(data)
                 for i, b in enumerate(imgs, 1):
                     pages.append((f"{name}#{i}ページ目", b))
+                if total > len(imgs):
+                    errors.append((name, f"{total}ページありますが、一度に処理できるのは"
+                                         f"{MAX_PAGES}ページまでです。{len(imgs)+1}ページ目以降は"
+                                         f"読み込んでいません。分割してお試しください。"))
             else:
                 pages.append((name, data))
         except Exception as e:
