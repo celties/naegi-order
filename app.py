@@ -142,7 +142,7 @@ button[data-testid="baseButton-secondary"] {
     color: transparent !important;
 }
 [data-testid="stFileUploaderDropzone"] div > div > span:last-of-type::after {
-    content: "対応形式: JPG・PNG・WEBP・HEIC（最大200MB）";
+    content: "対応形式: PDF・JPG・PNG・HEIC・TIFF（最大200MB）";
     font-size: 12px !important;
     color: #52b788 !important;
 }
@@ -579,6 +579,67 @@ def pages_to_bytes(pages, fmt):
     return buf.getvalue()
 
 
+# ─── スキャンPDF・複数ページTIFFを1枚ずつの画像に展開する ─────────
+PAGE_TYPES = ["jpg", "jpeg", "png", "webp", "heic", "heif", "pdf", "tif", "tiff"]
+MAX_PAGES = 300          # 事故防止の上限
+
+def pdf_to_images(data, dpi=200):
+    """複合機でまとめてスキャンしたPDFを1ページ=1枚のJPEGに分解する"""
+    import pypdfium2 as pdfium
+    out = []
+    pdf = pdfium.PdfDocument(data)
+    try:
+        for i in range(min(len(pdf), MAX_PAGES)):
+            img = pdf[i].render(scale=dpi / 72).to_pil().convert("RGB")
+            if max(img.size) > 1600:          # 送信サイズを抑える
+                img.thumbnail((1600, 1600), PIL.Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, "JPEG", quality=88)
+            out.append(buf.getvalue())
+    finally:
+        pdf.close()
+    return out
+
+def tiff_to_images(data):
+    """複数ページTIFFを1ページずつに分解する"""
+    out = []
+    img = PIL.Image.open(io.BytesIO(data))
+    for i in range(min(getattr(img, "n_frames", 1), MAX_PAGES)):
+        img.seek(i)
+        page = img.convert("RGB")
+        if max(page.size) > 1600:
+            page.thumbnail((1600, 1600), PIL.Image.LANCZOS)
+        buf = io.BytesIO()
+        page.save(buf, "JPEG", quality=88)
+        out.append(buf.getvalue())
+    return out
+
+def expand_uploads(files):
+    """アップロードされたファイル群を (表示名, 画像バイト列) の一覧に展開する。
+    PDF・TIFF は1ページずつ分解するので、複合機の一括スキャンをそのまま渡せる。"""
+    pages, errors = [], []
+    for f in files:
+        name = f.name
+        ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
+        data = f.getvalue()
+        try:
+            if ext == "pdf":
+                imgs = pdf_to_images(data)
+                if not imgs:
+                    raise ValueError("ページが読み取れませんでした")
+                for i, b in enumerate(imgs, 1):
+                    pages.append((f"{name}#{i}ページ目", b))
+            elif ext in ("tif", "tiff"):
+                imgs = tiff_to_images(data)
+                for i, b in enumerate(imgs, 1):
+                    pages.append((f"{name}#{i}ページ目", b))
+            else:
+                pages.append((name, data))
+        except Exception as e:
+            errors.append((name, f"ファイルを開けませんでした: {e}"))
+    return pages, errors
+
+
 # ─── 設定バー（モデル選択 ＋ マスタ状態） ────────────────────────
 cfg1, cfg2, cfg3 = st.columns([2, 2, 1])
 
@@ -613,14 +674,22 @@ with col_left:
     st.subheader("🍑🍇 注文書をアップロード")
     uploaded = st.file_uploader(
         "写真を選択",
-        type=["jpg", "jpeg", "png", "webp", "heic", "heif"],
+        type=PAGE_TYPES,
         accept_multiple_files=True,
         label_visibility="collapsed",
     )
 
     if uploaded:
-        n_up = len(uploaded)
-        st.info(f"📸 {n_up}枚を選択中")
+        with st.spinner("ファイルを確認中…"):
+            pages, open_errors = expand_uploads(uploaded)
+        n_up = len(pages)
+        n_files = len(uploaded)
+        if n_up != n_files:
+            st.info(f"📄 {n_files}ファイル → 注文書 {n_up}枚に展開しました")
+        else:
+            st.info(f"📸 {n_up}枚を選択中")
+        for nm, err in open_errors:
+            st.error(f"{nm}: {err}")
         if n_up > 50:
             st.warning(
                 f"⚠️ {n_up}枚は一度に処理する量としては多めです。"
@@ -629,11 +698,11 @@ with col_left:
             )
 
         if n_up == 1:
-            st.image(uploaded[0], use_container_width=True)
-        else:
-            with st.expander(f"選んだ写真を確認（{n_up}枚）"):
-                for f in uploaded[:12]:
-                    st.caption(f.name)
+            st.image(pages[0][1], use_container_width=True)
+        elif n_up > 1:
+            with st.expander(f"読み取る注文書を確認（{n_up}枚）"):
+                for nm, _ in pages[:12]:
+                    st.caption(nm)
                 if n_up > 12:
                     st.caption(f"…ほか {n_up - 12} 枚")
 
@@ -643,8 +712,8 @@ with col_left:
                  "無料プランなら2以下、有料プランなら4〜8がおすすめです。",
         )
 
-        if st.button(f"🔍 {n_up}枚を一括解析する", use_container_width=True, type="primary"):
-            files = [(f.name, f.getvalue()) for f in uploaded]
+        if n_up and st.button(f"🔍 {n_up}枚を一括解析する", use_container_width=True, type="primary"):
+            files = list(pages)
             varieties  = list(st.session_state.master_varieties)
             rootstocks = list(st.session_state.master_rootstocks)
 
@@ -880,6 +949,22 @@ with col_right:
             df_view = df_view.sort_values("ふりがな").reset_index(drop=True)
         elif sort_key == "電話番号順":
             df_view = df_view.sort_values("電話番号1").reset_index(drop=True)
+
+        # ── 顧客IDの取り違えチェック ──
+        _chk = df[df["顧客ID"].astype(str).str.strip() != ""]
+        _conf = (_chk.groupby("顧客ID")["お名前"]
+                     .agg(lambda s: sorted({x for x in s if str(x).strip()}))
+                     .loc[lambda s: s.map(len) > 1])
+        _noid = (df["顧客ID"].astype(str).str.strip() == "").sum()
+        if len(_conf):
+            st.error(
+                "**⚠️ 顧客IDが重複しています（別の方に同じ番号が付いています）**\n\n"
+                + "\n".join(f"- ID **{i}** → {' ／ '.join(n)}" for i, n in _conf.items())
+                + "\n\n読み取り間違いの可能性が高いので、下の表で確認・修正してください。"
+            )
+        if _noid:
+            st.warning(f"⚠️ 顧客IDが空欄の行が {_noid} 件あります。"
+                       "注文書のNo.欄が読み取れなかった可能性があります。")
 
         edit_mode = st.toggle("✏️ 表を直接編集する", value=False,
                               help="読み取り間違いをこの表の上で直せます。並び替えは「受付順」のときだけ編集できます。")
