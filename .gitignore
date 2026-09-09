@@ -8,3 +8,5 @@ __pycache__/
 *.pyc
 .DS_Store
 health_check.png
+monitor.log
+monitor.err.log
