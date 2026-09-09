@@ -10,3 +10,5 @@ __pycache__/
 health_check.png
 monitor.log
 monitor.err.log
+orders_data.json
+orders_data.json.tmp

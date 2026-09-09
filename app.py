@@ -246,8 +246,46 @@ def load_master_from_excel():
     except Exception:
         return [], []
 
+# ─── 注文データの保存（アプリを閉じても消えないようにする）─────────
+DATA_FILE = os.path.join(os.path.dirname(__file__), "orders_data.json")
+
+def load_orders():
+    """保存済みの注文一覧を読み込む。壊れていても落ちない。"""
+    try:
+        with open(DATA_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return [{c: str(r.get(c, "")) for c in COLUMNS}
+                    for r in data if isinstance(r, dict)]
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+    return []
+
+def save_orders(orders):
+    """一時ファイルに書いてから置き換える（書き込み中の停電等で壊さないため）"""
+    try:
+        tmp = DATA_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(orders, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, DATA_FILE)
+        return True
+    except Exception as e:
+        st.session_state.save_error = str(e)
+        return False
+
+def set_orders(rows):
+    """一覧を差し替えて即保存する。注文を変更するときは必ずこれを通す。"""
+    st.session_state.orders = rows
+    save_orders(rows)
+
+def add_orders(rows):
+    """一覧に追記して即保存する。"""
+    set_orders(st.session_state.orders + list(rows))
+
 if "orders" not in st.session_state:
-    st.session_state.orders = []
+    st.session_state.orders = load_orders()
 if "editing" not in st.session_state:
     st.session_state.editing = None
 if "last_failures" not in st.session_state:
@@ -658,7 +696,7 @@ with col_left:
             for nm, _ in pending:              # 全モデル試しても駄目だった分
                 failures.append((nm, "全モデルで利用枠切れ"))
 
-            st.session_state.orders.extend(ok_rows)
+            add_orders(ok_rows)
             st.session_state.last_failures = failures
             st.session_state.quota_hit = quota_hit if pending else None
 
@@ -728,9 +766,9 @@ with col_left:
                 df_in = df_in[COLUMNS]
                 new_rows = df_in.to_dict("records")
                 if mode == "既存を置き換える":
-                    st.session_state.orders = new_rows
+                    set_orders(new_rows)
                 else:
-                    st.session_state.orders.extend(new_rows)
+                    add_orders(new_rows)
                 msg = f"✅ {len(new_rows)}件を取り込みました。"
                 if missing:
                     msg += f"（ファイルに無かった列は空欄：{'・'.join(missing)}）"
@@ -805,7 +843,7 @@ with col_right:
                     "郵便番号":postal,"住所":address,
                     "items":new_items,"備考":notes,
                 }
-                st.session_state.orders.extend(flatten_to_rows(form_data))
+                add_orders(flatten_to_rows(form_data))
                 st.session_state.editing = None
                 st.rerun()
 
@@ -852,7 +890,7 @@ with col_right:
                 key="order_editor", height=460,
             )
             if st.button("💾 編集内容を保存", type="primary", use_container_width=True):
-                st.session_state.orders = edited.fillna("").astype(str).to_dict("records")
+                set_orders(edited.fillna("").astype(str).to_dict("records"))
                 st.success("保存しました。")
                 st.rerun()
         else:
@@ -935,7 +973,7 @@ with col_right:
             )
 
         if c3.button("🗑️ 全削除", use_container_width=True):
-            st.session_state.orders = []
+            set_orders([])
             st.rerun()
     else:
         st.info("まだ注文がありません。写真をアップロードするか、手入力で追加してください。")
