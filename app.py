@@ -217,7 +217,7 @@ button[data-testid="baseButton-secondary"] {
 
 # ─── 定数・マスタ読み込み ────────────────────────────────────────
 COLUMNS = ["顧客ID", "注文日", "受付方法", "支払方法", "ふりがな", "お名前",
-           "電話番号1", "電話番号2", "郵便番号", "住所", "品種名", "台木", "本数", "単価", "金額", "備考", "元ファイル"]
+           "電話番号1", "電話番号2", "郵便番号", "住所", "品種名", "台木", "本数", "単価", "金額", "要確認", "備考", "元ファイル"]
 UKETSUKE = ["", "電話", "FAX", "メール", "郵便", "来社"]
 SHIHARAI = ["", "郵便振替", "銀行振込", "代金引換", "現金"]
 MASTER_EXCEL = os.path.join(os.path.dirname(__file__), "苗木早見表　一覧.xlsx")
@@ -351,12 +351,15 @@ def _normalize(s):
     return unicodedata.normalize("NFKC", s).lower().strip()
 
 def find_closest(name, candidates, threshold=0.4):
+    """早見表の中から一番近い名前を返す。(採用した名前, 一致度) を返す。"""
     if not candidates or not name or not str(name).strip():
-        return name
+        return name, 1.0
     name_n = _normalize(str(name))
     scores = [(difflib.SequenceMatcher(None, name_n, _normalize(c)).ratio(), c) for c in candidates]
     best_score, best_candidate = max(scores)
-    return best_candidate if best_score >= threshold else name
+    if best_score >= threshold:
+        return best_candidate, best_score
+    return name, best_score
 
 def apply_master(items, varieties=None, rootstocks=None):
     # スレッドから呼ぶ場合は session_state を触れないので引数で渡す
@@ -365,10 +368,19 @@ def apply_master(items, varieties=None, rootstocks=None):
     result = []
     for item in items:
         corrected = item.copy()
+        notes = []
         if varieties:
-            corrected["品種名"] = find_closest(item.get("品種名", ""), varieties)
+            raw = str(item.get("品種名", "") or "").strip()
+            fixed, score = find_closest(raw, varieties)
+            corrected["品種名"] = fixed
+            # 全角/半角の違いだけなら黙って直す。中身が変わる置き換えは必ず知らせる。
+            if raw and _normalize(raw) != _normalize(fixed):
+                notes.append(f"品種名「{raw}」→「{fixed}」に置換（一致度{score:.0%}）")
         if rootstocks:
-            corrected["台木"] = find_closest(item.get("台木", ""), rootstocks)
+            raw_r = str(item.get("台木", "") or "").strip()
+            fixed_r, _ = find_closest(raw_r, rootstocks)
+            corrected["台木"] = fixed_r
+        corrected["要確認"] = " / ".join(notes)
         result.append(corrected)
     return result
 
@@ -539,6 +551,7 @@ def flatten_to_rows(form):
         row["品種名"] = item.get("品種名", "")
         row["台木"]   = item.get("台木", "")
         row["本数"]   = item.get("本数", "")
+        row["要確認"] = item.get("要確認", "")
         rows.append(row)
     return rows
 
@@ -1040,6 +1053,15 @@ with col_right:
                        "品種名か台木が早見表と一致していない可能性があります。"
                        "下の表で確認してください。")
 
+        # ── 品種名が置き換えられた行の警告 ──
+        _rep = df[df.get("要確認", pd.Series([""] * len(df))).astype(str).str.strip() != ""]
+        if len(_rep):
+            with st.expander(f"🔎 品種名を早見表に合わせた行が {len(_rep)}件あります（要確認）", expanded=True):
+                st.caption("手書きが読み取れなかった場合、似た名前に置き換わることがあります。"
+                           "今年度の取り扱いが無い品種は特にご注意ください。")
+                st.dataframe(_rep[["顧客ID", "お名前", "品種名", "台木", "本数", "要確認"]],
+                             use_container_width=True, hide_index=True)
+
         # ── 顧客IDの取り違えチェック ──
         _chk = df[df["顧客ID"].astype(str).str.strip() != ""]
         _conf = (_chk.groupby("顧客ID")["お名前"]
@@ -1074,12 +1096,20 @@ with col_right:
                 st.caption("⚠️ 編集するには並び替えを「受付順」にして、IDの絞り込みを空にしてください。")
             st.dataframe(df_view, use_container_width=True, hide_index=False, height=460)
 
-        with st.expander("📊 集計を見る"):
+        with st.expander("📊 集計（品種ごと・お客様ごと・全体）", expanded=True):
             df_c = df_view.copy()
             df_c["本数"] = pd.to_numeric(df_c["本数"], errors="coerce")
             df_c["金額"] = pd.to_numeric(df_c["金額"], errors="coerce")
 
-            st.markdown("**お客様ごとの請求額**")
+            st.markdown("### ① 品種ごとの合計金額")
+            summary = (df_c.groupby("品種名")
+                           .agg(合計本数=("本数", "sum"), 合計金額=("金額", "sum"))
+                           .reset_index().sort_values("合計本数", ascending=False))
+            summary["合計本数"] = summary["合計本数"].fillna(0).astype(int)
+            summary["合計金額"] = summary["合計金額"].fillna(0).astype(int)
+            st.dataframe(summary, use_container_width=True, hide_index=True)
+
+            st.markdown("### ② お客様ごとの合計金額")
             per = (df_c.groupby(["顧客ID", "お名前"], dropna=False)
                        .agg(品目数=("品種名", "count"), 合計本数=("本数", "sum"),
                             合計金額=("金額", "sum"))
@@ -1089,14 +1119,7 @@ with col_right:
             per["合計本数"] = per["合計本数"].fillna(0).astype(int)
             st.dataframe(per, use_container_width=True, hide_index=True)
 
-            st.markdown("**品種別の集計**")
-            summary = (df_c.groupby("品種名")
-                           .agg(合計本数=("本数", "sum"), 合計金額=("金額", "sum"))
-                           .reset_index().sort_values("合計本数", ascending=False))
-            summary["合計本数"] = summary["合計本数"].fillna(0).astype(int)
-            summary["合計金額"] = summary["合計金額"].fillna(0).astype(int)
-            st.dataframe(summary, use_container_width=True, hide_index=True)
-
+            st.markdown("### ③ 全体の合計")
             s1, s2 = st.columns(2)
             s1.metric("総合計本数", f"{int(df_c['本数'].fillna(0).sum()):,} 本")
             s2.metric("総合計金額（税込）", f"{int(df_c['金額'].fillna(0).sum()):,} 円")
