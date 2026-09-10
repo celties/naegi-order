@@ -217,7 +217,7 @@ button[data-testid="baseButton-secondary"] {
 
 # ─── 定数・マスタ読み込み ────────────────────────────────────────
 COLUMNS = ["顧客ID", "注文日", "受付方法", "支払方法", "ふりがな", "お名前",
-           "電話番号1", "電話番号2", "郵便番号", "住所", "品種名", "台木", "本数", "備考", "元ファイル"]
+           "電話番号1", "電話番号2", "郵便番号", "住所", "品種名", "台木", "本数", "単価", "金額", "備考", "元ファイル"]
 UKETSUKE = ["", "電話", "FAX", "メール", "郵便", "来社"]
 SHIHARAI = ["", "郵便振替", "銀行振込", "代金引換", "現金"]
 MASTER_EXCEL = os.path.join(os.path.dirname(__file__), "苗木早見表　一覧.xlsx")
@@ -238,13 +238,60 @@ MODEL_LABELS = {
 }
 
 def load_master_from_excel():
+    """苗木早見表から 品種名・台木・価格表・果樹の種類 を読み込む。
+
+    「50音順」シートの構成:
+      1列目=品種名（同じ品種が続く行は空欄）／2列目=台木
+      3列目=税込み価格／4列目=果樹の種類
+    価格は（品種名 × 台木）の組み合わせごとに決まる。
+    """
     try:
         df = pd.read_excel(MASTER_EXCEL, sheet_name="50音順", header=None)
-        varieties  = [v for v in df[1].dropna().astype(str).str.strip() if v not in ("品種名","nan","")]
-        rootstocks = [r for r in df[2].dropna().astype(str).str.strip() if r not in ("台木","nan","")]
-        return list(dict.fromkeys(varieties)), list(dict.fromkeys(rootstocks))
+        d = df[[1, 2, 3, 4]].copy()
+        d.columns = ["品種名", "台木", "価格", "種類"]
+        d = d[~d["品種名"].astype(str).str.strip().eq("品種名")]   # 見出し行を除く
+        d["品種名"] = d["品種名"].ffill()                          # 空欄は上の品種を引き継ぐ
+        d["種類"] = d["種類"].ffill()
+        d = d.dropna(subset=["台木"])
+        d["品種名"] = d["品種名"].astype(str).str.strip()
+        d["台木"] = d["台木"].astype(str).str.strip()
+        d["価格"] = pd.to_numeric(d["価格"], errors="coerce")
+        d = d[~d["品種名"].isin(["nan", ""]) & ~d["台木"].isin(["nan", "", "台木"])]
+
+        prices, kinds = {}, {}
+        for r in d.itertuples(index=False):
+            if pd.notna(r.価格):
+                prices[(r.品種名, r.台木)] = int(r.価格)
+            if pd.notna(r.種類):
+                kinds[r.品種名] = str(r.種類).strip()
+
+        varieties  = list(dict.fromkeys(d["品種名"].tolist()))
+        rootstocks = list(dict.fromkeys(d["台木"].tolist()))
+        return varieties, rootstocks, prices, kinds
     except Exception:
-        return [], []
+        return [], [], {}, {}
+
+def lookup_price(variety, rootstock, prices):
+    """品種名と台木の組み合わせから税込み単価を引く。無ければ None。"""
+    v, r = str(variety or "").strip(), str(rootstock or "").strip()
+    if not v:
+        return None
+    if (v, r) in prices:
+        return prices[(v, r)]
+    # 台木が未記入でも、その品種の価格が1種類しかなければ確定できる
+    cand = {p for (pv, _), p in prices.items() if pv == v}
+    if len(cand) == 1:
+        return cand.pop()
+    return None
+
+def price_rows(rows, prices):
+    """各行に単価と金額を入れる。"""
+    for row in rows:
+        unit = lookup_price(row.get("品種名"), row.get("台木"), prices)
+        qty = pd.to_numeric(str(row.get("本数", "")).strip() or "0", errors="coerce")
+        row["単価"] = str(unit) if unit is not None else ""
+        row["金額"] = str(int(unit * qty)) if (unit is not None and pd.notna(qty)) else ""
+    return rows
 
 # ─── 注文データの保存（アプリを閉じても消えないようにする）─────────
 DATA_FILE = os.path.join(os.path.dirname(__file__), "orders_data.json")
@@ -294,8 +341,9 @@ if "quota_hit" not in st.session_state:
     st.session_state.quota_hit = None
 if "print_bytes" not in st.session_state:
     st.session_state.print_bytes = None
-if "master_varieties" not in st.session_state or "master_rootstocks" not in st.session_state:
-    st.session_state.master_varieties, st.session_state.master_rootstocks = load_master_from_excel()
+if "master_varieties" not in st.session_state or "master_prices" not in st.session_state:
+    (st.session_state.master_varieties, st.session_state.master_rootstocks,
+     st.session_state.master_prices, st.session_state.master_kinds) = load_master_from_excel()
 
 
 # ─── ヘルパー関数 ────────────────────────────────────────────────
@@ -447,7 +495,7 @@ JSONのみ返してください。"""
             raise last_err
     raise last_err
 
-def parse_one_image(name, image_bytes, model, varieties, rootstocks):
+def parse_one_image(name, image_bytes, model, varieties, rootstocks, prices=None):
     """写真1枚を解析して行データに変換する。並列実行される（session_state 不可）"""
     result = extract_order_from_image(image_bytes, "image/jpeg", model, varieties, rootstocks)
     if isinstance(result, list):
@@ -467,6 +515,8 @@ def parse_one_image(name, image_bytes, model, varieties, rootstocks):
     rows = flatten_to_rows(result)
     for r in rows:
         r["元ファイル"] = name
+    if prices:
+        price_rows(rows, prices)
     return rows
 
 def clean_phone(v):
@@ -672,7 +722,8 @@ with cfg2:
 
 with cfg3:
     if st.button("🔄 マスタ再読み込み", use_container_width=True):
-        st.session_state.master_varieties, st.session_state.master_rootstocks = load_master_from_excel()
+        (st.session_state.master_varieties, st.session_state.master_rootstocks,
+         st.session_state.master_prices, st.session_state.master_kinds) = load_master_from_excel()
         st.rerun()
 
 st.divider()
@@ -741,6 +792,7 @@ with col_left:
             files = list(pages)
             varieties  = list(st.session_state.master_varieties)
             rootstocks = list(st.session_state.master_rootstocks)
+            prices     = dict(st.session_state.master_prices)
 
             # 選んだモデルから順に、枠切れしたら自動で次のモデルへ降格して続行する
             chain = [selected_model] + [m for m in FALLBACK_MODELS if m != selected_model]
@@ -763,7 +815,7 @@ with col_left:
                 retry_next, quota_hit = [], None
                 with ThreadPoolExecutor(max_workers=workers) as ex:
                     futs = {ex.submit(parse_one_image, nm, data, model_name,
-                                      varieties, rootstocks): (nm, data)
+                                      varieties, rootstocks, prices): (nm, data)
                             for nm, data in pending}
                     for fut in as_completed(futs):
                         nm, data = futs[fut]
@@ -859,7 +911,7 @@ with col_left:
                 for c in missing:
                     df_in[c] = ""
                 df_in = df_in[COLUMNS]
-                new_rows = df_in.to_dict("records")
+                new_rows = price_rows(df_in.to_dict("records"), st.session_state.master_prices)
                 if mode == "既存を置き換える":
                     set_orders(new_rows)
                 else:
@@ -938,7 +990,7 @@ with col_right:
                     "郵便番号":postal,"住所":address,
                     "items":new_items,"備考":notes,
                 }
-                add_orders(flatten_to_rows(form_data))
+                add_orders(price_rows(flatten_to_rows(form_data), st.session_state.master_prices))
                 st.session_state.editing = None
                 st.rerun()
 
@@ -976,6 +1028,18 @@ with col_right:
         elif sort_key == "電話番号順":
             df_view = df_view.sort_values("電話番号1").reset_index(drop=True)
 
+        # ── 金額の集計 ──
+        _amt = pd.to_numeric(df["金額"], errors="coerce")
+        _total = int(_amt.fillna(0).sum())
+        _nop = int(_amt.isna().sum())          # 単価が引けなかった行
+        mc1, mc2 = st.columns([1, 1])
+        mc1.metric("💰 合計金額（税込）", f"{_total:,} 円")
+        mc2.metric("🌱 合計本数", f"{int(pd.to_numeric(df['本数'], errors='coerce').fillna(0).sum()):,} 本")
+        if _nop:
+            st.warning(f"⚠️ {_nop}件は単価が分からないため金額に入っていません。"
+                       "品種名か台木が早見表と一致していない可能性があります。"
+                       "下の表で確認してください。")
+
         # ── 顧客IDの取り違えチェック ──
         _chk = df[df["顧客ID"].astype(str).str.strip() != ""]
         _conf = (_chk.groupby("顧客ID")["お名前"]
@@ -1001,7 +1065,8 @@ with col_right:
                 key="order_editor", height=460,
             )
             if st.button("💾 編集内容を保存", type="primary", use_container_width=True):
-                set_orders(edited.fillna("").astype(str).to_dict("records"))
+                set_orders(price_rows(edited.fillna("").astype(str).to_dict("records"),
+                                      st.session_state.master_prices))
                 st.success("保存しました。")
                 st.rerun()
         else:
@@ -1009,13 +1074,32 @@ with col_right:
                 st.caption("⚠️ 編集するには並び替えを「受付順」にして、IDの絞り込みを空にしてください。")
             st.dataframe(df_view, use_container_width=True, hide_index=False, height=460)
 
-        with st.expander("📊 品種別 集計"):
+        with st.expander("📊 集計を見る"):
             df_c = df_view.copy()
             df_c["本数"] = pd.to_numeric(df_c["本数"], errors="coerce")
-            summary = df_c.groupby("品種名")["本数"].sum().reset_index()
-            summary.columns = ["品種名", "合計本数"]
+            df_c["金額"] = pd.to_numeric(df_c["金額"], errors="coerce")
+
+            st.markdown("**お客様ごとの請求額**")
+            per = (df_c.groupby(["顧客ID", "お名前"], dropna=False)
+                       .agg(品目数=("品種名", "count"), 合計本数=("本数", "sum"),
+                            合計金額=("金額", "sum"))
+                       .reset_index()
+                       .sort_values("顧客ID", key=lambda s: pd.to_numeric(s, errors="coerce")))
+            per["合計金額"] = per["合計金額"].fillna(0).astype(int)
+            per["合計本数"] = per["合計本数"].fillna(0).astype(int)
+            st.dataframe(per, use_container_width=True, hide_index=True)
+
+            st.markdown("**品種別の集計**")
+            summary = (df_c.groupby("品種名")
+                           .agg(合計本数=("本数", "sum"), 合計金額=("金額", "sum"))
+                           .reset_index().sort_values("合計本数", ascending=False))
+            summary["合計本数"] = summary["合計本数"].fillna(0).astype(int)
+            summary["合計金額"] = summary["合計金額"].fillna(0).astype(int)
             st.dataframe(summary, use_container_width=True, hide_index=True)
-            st.metric("総合計", f"{int(df_c['本数'].sum()):,} 本")
+
+            s1, s2 = st.columns(2)
+            s1.metric("総合計本数", f"{int(df_c['本数'].fillna(0).sum()):,} 本")
+            s2.metric("総合計金額（税込）", f"{int(df_c['金額'].fillna(0).sum()):,} 円")
 
         st.divider()
         date_str = datetime.now().strftime("%y%m%d")
@@ -1040,11 +1124,49 @@ with col_right:
 
         excel_buf = io.BytesIO()
         with pd.ExcelWriter(excel_buf, engine="openpyxl") as writer:
-            df_out.to_excel(writer, index=False, sheet_name="注文一覧")
-            ws = writer.sheets["注文一覧"]
-            for col_cells in ws.columns:
-                max_w = max(cell_width(cell.value) for cell in col_cells)
-                ws.column_dimensions[col_cells[0].column_letter].width = min(max(max_w+2,10),60)
+            # 1枚目: 注文一覧（最終行に合計を入れる）
+            _x = df_out.copy()
+            _x["本数"] = pd.to_numeric(_x["本数"], errors="coerce")
+            _x["金額"] = pd.to_numeric(_x["金額"], errors="coerce")
+            _sum = {c: "" for c in _x.columns}
+            _sum["お名前"] = "■ 合計"
+            _sum["本数"] = int(_x["本数"].fillna(0).sum())
+            _sum["金額"] = int(_x["金額"].fillna(0).sum())
+            _x = pd.concat([_x, pd.DataFrame([_sum])], ignore_index=True)
+            _x.to_excel(writer, index=False, sheet_name="注文一覧")
+
+            # 2枚目: お客様ごとの請求額
+            _p = df_out.copy()
+            _p["本数"] = pd.to_numeric(_p["本数"], errors="coerce")
+            _p["金額"] = pd.to_numeric(_p["金額"], errors="coerce")
+            per = (_p.groupby(["顧客ID", "お名前", "電話番号1"], dropna=False)
+                     .agg(品目数=("品種名", "count"), 合計本数=("本数", "sum"),
+                          合計金額=("金額", "sum")).reset_index()
+                     .sort_values("顧客ID", key=lambda s: pd.to_numeric(s, errors="coerce")))
+            per["合計本数"] = per["合計本数"].fillna(0).astype(int)
+            per["合計金額"] = per["合計金額"].fillna(0).astype(int)
+            per = pd.concat([per, pd.DataFrame([{
+                "顧客ID": "", "お名前": "■ 合計", "電話番号1": "",
+                "品目数": int(per["品目数"].sum()),
+                "合計本数": int(per["合計本数"].sum()),
+                "合計金額": int(per["合計金額"].sum())}])], ignore_index=True)
+            per.to_excel(writer, index=False, sheet_name="お客様ごと請求")
+
+            from openpyxl.styles import Font
+            for sheet_name, frame in (("注文一覧", _x), ("お客様ごと請求", per)):
+                ws = writer.sheets[sheet_name]
+                for col_cells in ws.columns:
+                    max_w = max(cell_width(cell.value) for cell in col_cells)
+                    ws.column_dimensions[col_cells[0].column_letter].width = min(max(max_w+2,10),60)
+                for cell in ws[1]:                       # 見出しを太字に
+                    cell.font = Font(bold=True)
+                for cell in ws[ws.max_row]:              # 合計行を太字に
+                    cell.font = Font(bold=True)
+                # 金額・単価列に円マークの書式を付ける
+                for idx, name in enumerate(frame.columns, start=1):
+                    if name in ("金額", "単価", "合計金額"):
+                        for row in range(2, ws.max_row + 1):
+                            ws.cell(row=row, column=idx).number_format = '#,##0"円"' 
         c2.download_button(
             "📥 Excelダウンロード",
             data=excel_buf.getvalue(),
